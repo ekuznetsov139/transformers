@@ -113,6 +113,8 @@ class AutoQuantizationConfig:
     @classmethod
     def from_dict(cls, quantization_config_dict: Dict):
         quant_method = quantization_config_dict.get("quant_method", None)
+        if quant_method=="fp8" and quantization_config_dict.get("activation_scheme","")=="static":
+            quant_method = "quark"
         # We need a special care for bnb models to make sure everything is BC ..
         if quantization_config_dict.get("load_in_8bit", False) or quantization_config_dict.get("load_in_4bit", False):
             suffix = "_4bit" if quantization_config_dict.get("load_in_4bit", False) else "_8bit"

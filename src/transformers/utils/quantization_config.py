@@ -1901,7 +1901,8 @@ class QuarkConfig(QuantizationConfigMixin):
 
         if self.custom_mode in ["awq", "fp8"]:
             # Legacy (quark<1.0) or custom export.
-            self.quant_config = QuantConfigParser.from_custom_config(kwargs, is_bias_quantized=False)
+            self.quant_config = QuantConfigParser.from_custom_config(kwargs, is_bias_quantized=False,
+                is_kv_cache=False, kv_layers_name=None)
             self.json_export_config = JsonExporterConfig()
         else:
             self.quant_config = Config.from_dict(kwargs)
