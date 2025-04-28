@@ -38,17 +38,18 @@ def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis=0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x = tl.load(x_ptr + offs).to(tl.float32)
-    s = tl.max(tl.abs(x)) / 448.0
-    y = x / s
+    fp8range = (240.0 if y_ptr.dtype.element_ty==tl.float8e4b8 else 448.0)
+    s = tl.maximum(tl.max(tl.abs(x)) / fp8range, 0.001)
+    y = tl.clamp(x / s, -fp8range, fp8range)
     y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y)
     tl.store(s_ptr + pid, s)
 
 
-def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+def act_quant(x: torch.Tensor, block_size: int = 128, dtype = torch.float8_e4m3fn) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.is_contiguous()
     assert x.shape[-1] % block_size == 0
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    y = torch.empty_like(x, dtype=dtype)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
 
     def grid(meta):
@@ -115,6 +116,9 @@ def _w8a8_block_fp8_matmul(
     As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+    # torch float8_e4m3fn -> tl.float8e4nv
+    # torch float8_e4m3fnuz -> tl.float8e4b8
+    fixed_scale = 2 if A.dtype.element_ty==tl.float8e4b8 else 1
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -126,7 +130,7 @@ def _w8a8_block_fp8_matmul(
         a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :] * fixed_scale
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -291,9 +295,12 @@ def w8a8_block_fp8_matmul_compile(
     return output.to(output_dtype)
 
 
-class FP8Linear(nn.Linear):
-    dtype = torch.float8_e4m3fn
+def FP8linear_post_load_hook(self, incompatible_keys):
+    if self.weight.dtype != self.float8_dtype:
+        w32=torch.clamp(self.weight.to(torch.float32)*0.5, -240.0, 240.0) 
+        self.weight = torch.nn.Parameter(w32.to(self.float8_dtype))
 
+class FP8Linear(nn.Linear):
     def __init__(
         self,
         in_features: int,
@@ -304,12 +311,16 @@ class FP8Linear(nn.Linear):
         device=None,
         activation_scheme="dynamic",
     ):
+        self.is_fp8_linear = True
+        self.float8_dtype = torch.float8_e4m3fn
+        if device is not None:
+            if 'gfx942' in torch.cuda.get_device_properties(device.index).gcnArchName:
+                self.float8_dtype = torch.float8_e4m3fnuz
         super().__init__(in_features, out_features)
         self.in_features = in_features
         self.out_features = out_features
 
-        self.weight = torch.nn.Parameter(torch.empty(out_features, in_features, dtype=FP8Linear.dtype, device=device))
-
+        self.weight = torch.nn.Parameter(torch.empty(out_features, in_features, dtype=self.float8_dtype, device=device))
         if self.weight.element_size() == 1:
             scale_out_features = (out_features + block_size[0] - 1) // block_size[0]
             scale_in_features = (in_features + block_size[1] - 1) // block_size[1]
@@ -327,18 +338,20 @@ class FP8Linear(nn.Linear):
             self.bias = nn.Parameter(torch.empty(self.out_features))
         else:
             self.register_parameter("bias", None)
+        self.register_load_state_dict_post_hook(FP8linear_post_load_hook)
+
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.weight.element_size() > 1:
             return F.linear(input, self.weight, self.bias)
         else:
-            # Context manager used to switch among the available cuda devices
-            # with torch.cuda.device(input.device):
-            qinput, scale = act_quant(input, self.block_size[1])
-            # Blocks the CPU until all CUDA operations on the specified device are complete. It is used to ensure that the results of the
-            # preceding operations are ready before proceeding
-            # torch.cuda.synchronize(device=self.weight.device)
             with torch.cuda.device(input.device):
+                # Context manager used to switch among the available cuda devices
+                # with torch.cuda.device(input.device):
+                qinput, scale = act_quant(input, self.block_size[1], self.float8_dtype)
+                # Blocks the CPU until all CUDA operations on the specified device are complete. It is used to ensure that the results of the
+                # preceding operations are ready before proceeding
+                # torch.cuda.synchronize(device=self.weight.device)
                 output = w8a8_block_fp8_matmul_triton(
                     qinput,
                     self.weight,
